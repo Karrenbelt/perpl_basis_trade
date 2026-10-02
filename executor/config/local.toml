@@ -1,0 +1,59 @@
+# Local anvil fork of Monad mainnet. Addresses are the live mainnet ones -
+# the fork serves real Perpl and Kuru state, so nothing here is a stub.
+rpc_url = "http://127.0.0.1:8545"
+trader = "0x3C2BafebbB0c8c58f39A976e725cD20D611d01e9"
+perpl_exchange = "0x34B6552d57a35a1D042CcAe1951BD1C370112a6F"
+poll_interval_ms = 2000
+dry_run = true
+
+# AUSD per USDC, ppm. Static: every Kuru AUSD/USDC book is either disabled or
+# empty, so there is nothing on-chain to read it from. The contract bounds it.
+cash_peg_ppm = 999600
+
+# Clip sizes are small because the books are: Perpl's BTC bid holds roughly
+# 0.004 BTC near touch and Kuru's cbBTC ask a few thousand dollars. See
+# smart_contracts/test/VenueDepth.t.sol.
+
+[[markets]]
+name = "BTC"
+perp_id = 1
+route = ["0x40c49F171202F91ff5d2faE34c22dD2BFdD22aF0"]   # cbBTC/USDC
+is_buy = [true]
+spot_decimals = 8
+clip_cash = "300000000"          # 300 USDC
+clip_margin_ausd = "200000000"   # 200 AUSD
+perp_limit_offset_bps = 30
+max_slippage_bps = 100
+lot_band_bps = 1000
+max_matches = 100
+max_position_lots = "2000"       # ~0.02 BTC
+
+[[markets]]
+name = "ETH"
+perp_id = 20
+route = ["0xa6aFD386135B7D41A6C40C525abC4A1019b0D132"]   # WETH/USDC
+is_buy = [true]
+spot_decimals = 18
+clip_cash = "300000000"
+clip_margin_ausd = "200000000"
+perp_limit_offset_bps = 30
+max_slippage_bps = 100
+lot_band_bps = 1000
+max_matches = 100
+max_position_lots = "500"        # ~0.5 ETH
+
+[[markets]]
+name = "MON"
+perp_id = 10
+route = ["0x065C9d28E428A0db40191a54d33d5b7c71a9C394"]   # MON/USDC, native base
+is_buy = [true]
+spot_decimals = 18
+# Smaller clip and a wider reach: 300 USDC is ~9,000 MON and the Perpl MON bid
+# does not hold that within 30bps, so the fill-or-kill never completes.
+clip_cash = "150000000"
+clip_margin_ausd = "100000000"
+perp_limit_offset_bps = 60
+max_slippage_bps = 100
+lot_band_bps = 1000
+max_matches = 100
+max_position_lots = "50000"      # 50,000 MON

@@ -1,0 +1,33 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+solc = "0.8.28"
+optimizer = true
+optimizer_runs = 1000
+via_ir = true
+evm_version = "cancun"
+fs_permissions = [{ access = "read", path = "./" }]
+
+[profile.default.fuzz]
+runs = 256
+
+[lint]
+# Perpl and Kuru name their ABI fields `lotLNS`, `pricePNS`, `amountCNS` and so
+# on, and the structs here have to encode identically or the calls revert on
+# decode. The scale suffixes carry through to our own helpers deliberately, so
+# that a value's units are visible at every call site. Renaming them to satisfy
+# a casing rule would cost more than it buys.
+exclude_lints = ["mixed-case-variable", "mixed-case-function"]
+
+[rpc_endpoints]
+monad = "${MONAD_RPC_URL}"
+monad_testnet = "${MONAD_TESTNET_RPC_URL}"
+
+[fmt]
+line_length = 110
+tab_width = 4
+bracket_spacing = false
+int_types = "long"

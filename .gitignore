@@ -1,0 +1,6 @@
+executor/target/
+smart_contracts/out/
+smart_contracts/cache/
+smart_contracts/broadcast/
+smart_contracts/lib/
+.env
