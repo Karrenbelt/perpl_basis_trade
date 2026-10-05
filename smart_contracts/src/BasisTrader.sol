@@ -5,6 +5,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import {
     IPerplExchange,
@@ -187,6 +189,7 @@ contract BasisTrader is Ownable2Step, ReentrancyGuard {
     error SizeOverflow(uint256 value);
     error PegOutOfBand(uint32 peg, uint32 min, uint32 max);
     error BadPegBand();
+    error ZeroAddress();
 
     // --------------------------------------------------------------------
     // Setup
@@ -214,7 +217,7 @@ contract BasisTrader is Ownable2Step, ReentrancyGuard {
     /// @notice Open this contract's Perpl account, seeding it with `amountCNS` AUSD.
     /// @dev Perpl keys accounts by address, so the contract - not the operator -
     ///      must be the one to call `createAccount`, and it can only ever have one.
-    function openPerplAccount(uint256 amountCNS) external onlyOwner returns (uint256 accountId) {
+    function openPerplAccount(uint256 amountCNS) external nonReentrant onlyOwner returns (uint256 accountId) {
         if (perplAccountId != 0) revert AccountAlreadyOpen();
         AUSD.forceApprove(address(PERPL), amountCNS);
         accountId = PERPL.createAccount(amountCNS);
@@ -231,8 +234,8 @@ contract BasisTrader is Ownable2Step, ReentrancyGuard {
         if (market.minEntryEdgePpm < 0) revert NegativeEdgeFloor();
         if (market.minCashPegPpm == 0 || market.minCashPegPpm > market.maxCashPegPpm) revert BadPegBand();
         PerpetualInfoV2 memory info = PERPL.getPerpetualInfoV2(perpId);
-        market.priceDecimals = uint8(info.priceDecimals);
-        market.lotDecimals = uint8(info.lotDecimals);
+        market.priceDecimals = SafeCast.toUint8(info.priceDecimals);
+        market.lotDecimals = SafeCast.toUint8(info.lotDecimals);
         markets[perpId] = market;
         emit MarketSet(perpId, market);
     }
@@ -256,22 +259,23 @@ contract BasisTrader is Ownable2Step, ReentrancyGuard {
     }
 
     function sweep(address token, address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        emit Swept(token, to, amount);
         if (token == address(0)) {
             (bool ok,) = to.call{value: amount}("");
             if (!ok) revert NativeTransferFailed();
         } else {
             IERC20(token).safeTransfer(to, amount);
         }
-        emit Swept(token, to, amount);
     }
 
     /// @notice Move AUSD from this contract into the Perpl account's free balance.
     function depositMargin(uint256 amountCNS) public onlyKeeper {
         if (perplAccountId == 0) revert AccountNotOpen();
+        emit MarginDeposited(amountCNS);
         AUSD.forceApprove(address(PERPL), amountCNS);
         PERPL.depositCollateral(amountCNS);
         AUSD.forceApprove(address(PERPL), 0);
-        emit MarginDeposited(amountCNS);
     }
 
     /// @notice Pull AUSD out of the Perpl account back into this contract.
@@ -279,15 +283,15 @@ contract BasisTrader is Ownable2Step, ReentrancyGuard {
     ///      rather than something `exit` does inline - a throttled withdrawal
     ///      must not be able to revert an otherwise good unwind.
     function withdrawMargin(uint256 amountCNS) external onlyOwner {
-        PERPL.withdrawCollateral(amountCNS);
         emit MarginWithdrawn(amountCNS);
+        PERPL.withdrawCollateral(amountCNS);
     }
 
     /// @notice Add collateral to an open position that has drifted toward its
     ///         maintenance margin.
     function topUpPosition(uint256 perpId, uint256 amountCNS) external onlyKeeper {
-        PERPL.increasePositionCollateral(perpId, amountCNS);
         emit PositionToppedUp(perpId, amountCNS);
+        PERPL.increasePositionCollateral(perpId, amountCNS);
     }
 
     // --------------------------------------------------------------------
@@ -299,7 +303,7 @@ contract BasisTrader is Ownable2Step, ReentrancyGuard {
     ///      from what actually filled rather than from a quote that may be
     ///      stale by inclusion. The perp leg is then fill-or-kill against that
     ///      exact size, and the edge is checked against both realised fills.
-    function enter(EnterParams calldata p) external onlyKeeper nonReentrant returns (Fill memory fill) {
+    function enter(EnterParams calldata p) external nonReentrant onlyKeeper returns (Fill memory fill) {
         Market memory m = markets[p.perpId];
         if (!m.enabled) revert MarketDisabled(p.perpId);
         if (perplAccountId == 0) revert AccountNotOpen();
@@ -342,10 +346,9 @@ contract BasisTrader is Ownable2Step, ReentrancyGuard {
         //
         // Kuru's taker fee and its slippage are already inside `cashIn /
         // assetOut`; only Perpl's taker fee still has to come off by hand.
-        uint256 cashCNS = (p.cashIn * p.cashPegPpm) / BasisMath.PPM;
-        uint256 spotNotionalCNS = (cashCNS * hedged) / assetOut;
-        int256 edgePpm =
-            BasisMath.relativePpm(perpNotionalCNS, spotNotionalCNS) - int256(PERPL.getTakerFee(p.perpId));
+        uint256 spotNotionalCNS = Math.mulDiv(p.cashIn * p.cashPegPpm, hedged, BasisMath.PPM * assetOut);
+        int256 edgePpm = BasisMath.relativePpm(perpNotionalCNS, spotNotionalCNS)
+            - SafeCast.toInt256(PERPL.getTakerFee(p.perpId));
         if (edgePpm < m.minEntryEdgePpm) revert EdgeTooThin(edgePpm, m.minEntryEdgePpm);
 
         fill = Fill({
@@ -364,7 +367,7 @@ contract BasisTrader is Ownable2Step, ReentrancyGuard {
     // --------------------------------------------------------------------
 
     /// @notice Close the short and sell the spot back to AUSD, atomically.
-    function exit(ExitParams calldata p) external onlyKeeper nonReentrant returns (Fill memory fill) {
+    function exit(ExitParams calldata p) external nonReentrant onlyKeeper returns (Fill memory fill) {
         return _exit(p, false);
     }
 
@@ -374,7 +377,7 @@ contract BasisTrader is Ownable2Step, ReentrancyGuard {
     ///      would refuse - margin pressure, funding turning against the short.
     ///      Owner-only, because skipping the gate is exactly the power the
     ///      keeper is not meant to have.
-    function forceExit(ExitParams calldata p) external onlyOwner nonReentrant returns (Fill memory fill) {
+    function forceExit(ExitParams calldata p) external nonReentrant onlyOwner returns (Fill memory fill) {
         return _exit(p, true);
     }
 
@@ -406,8 +409,8 @@ contract BasisTrader is Ownable2Step, ReentrancyGuard {
         // Mirror of the entry gate: on the way out the spot sale is the credit
         // and buying the short back is the debit.
         uint256 spotNotionalCNS = (cashOut * p.cashPegPpm) / BasisMath.PPM;
-        int256 edgePpm =
-            BasisMath.relativePpm(spotNotionalCNS, perpNotionalCNS) - int256(PERPL.getTakerFee(p.perpId));
+        int256 edgePpm = BasisMath.relativePpm(spotNotionalCNS, perpNotionalCNS)
+            - SafeCast.toInt256(PERPL.getTakerFee(p.perpId));
         if (!forced && edgePpm < m.minExitEdgePpm) revert EdgeTooThin(edgePpm, m.minExitEdgePpm);
 
         fill = Fill({

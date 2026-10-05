@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+
 import {PositionInfoV2} from "../interfaces/IPerplExchange.sol";
 
 /// @title Fixed-point conversions between Perpl's three scales and token units.
@@ -85,13 +87,9 @@ library BasisMath {
 
         bool gain = value >= basis;
         uint256 magnitude = (absDiff(value, basis) * PPM) / basis;
-        // A ratio this extreme cannot come from two notionals of the same
-        // asset; it means a caller passed something that is not a notional.
-        if (magnitude > uint256(type(int256).max)) revert PriceOverflow();
-
-        // Bounded above, so the cast cannot truncate or change sign.
-        // forge-lint: disable-next-line(unsafe-typecast)
-        int256 signed = int256(magnitude);
+        // A magnitude above int256's maximum cannot come from two notionals of
+        // the same asset; SafeCast reverts on it rather than wrapping negative.
+        int256 signed = SafeCast.toInt256(magnitude);
         return gain ? signed : -signed;
     }
 
