@@ -4,7 +4,7 @@ pragma solidity ^0.8.28;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
@@ -32,7 +32,7 @@ import {BasisMath} from "./libraries/BasisMath.sol";
 /// Both legs are taker-only and fill-or-kill. There is deliberately no path
 /// that leaves one leg on and the other off: a short spot fill, a short perp
 /// fill, or a thin edge all unwind the whole transaction.
-contract BasisTrader is Ownable2Step, ReentrancyGuard {
+contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
     using BasisMath for PositionInfoV2;
 
