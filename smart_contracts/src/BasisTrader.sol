@@ -310,6 +310,8 @@ contract BasisTrader is Ownable2Step, ReentrancyGuard {
 
         _checkPeg(m, p.cashPegPpm);
 
+        if (p.marginCNS != 0) depositMargin(p.marginCNS);
+
         uint256 assetOut = _buySpot(m, p);
         if (assetOut < p.minAssetOut) revert SpotFillTooSmall(assetOut, p.minAssetOut);
 
@@ -321,8 +323,6 @@ contract BasisTrader is Ownable2Step, ReentrancyGuard {
         uint256 hedged = BasisMath.lotsToToken(lotLNS, m.spotDecimals, m.lotDecimals);
         uint256 driftPpm = ((assetOut - hedged) * BasisMath.PPM) / assetOut;
         if (driftPpm > m.maxHedgeDriftPpm) revert HedgeDrift(driftPpm, m.maxHedgeDriftPpm);
-
-        if (p.marginCNS != 0) depositMargin(p.marginCNS);
 
         (uint256 perpNotionalCNS, uint256 filledLots) = _tradePerp(
             m,
