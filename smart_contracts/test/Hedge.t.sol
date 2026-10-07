@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+import {Vm} from "forge-std/Vm.sol";
+
+import {HedgeFixture} from "./HedgeFixture.sol";
+import {Mainnet} from "./Addresses.sol";
+import {BasisTrader} from "../src/BasisTrader.sol";
+import {
+    IPerplExchange,
+    OrderDesc,
+    OrderSignature,
+    OrderV2,
+    PerpetualInfoV2,
+    PositionInfoV2
+} from "../src/interfaces/IPerplExchange.sol";
+import {DeployHedge} from "../script/DeployHedge.s.sol";
+
+contract HedgeTest is HedgeFixture {
+    address internal keeper = makeAddr("keeper");
+    address internal outsider = makeAddr("outsider");
+
+    bytes32 internal constant ORDER_REQUEST_V2 = keccak256(
+        "OrderRequestV2(uint256,uint256,uint256,uint256,uint8,uint256,uint256,uint256,bool,bool,bool,uint256,uint256,uint256,uint256,uint256,uint256,bytes)"
+    );
+
+    function setUp() public {
+        _setUpTrader();
+        trader.setKeeper(keeper, true);
+        vm.deal(address(trader), LOTS * 1e18);
+    }
+
+    function test_hedgePostsAndRecords() public {
+        uint256 price = _insideAsk();
+        BasisTrader.HedgeParams memory p = _hedgeParams(LOTS, price);
+
+        vm.expectEmit(true, true, false, false, address(trader));
+        emit BasisTrader.HedgePosted(Mainnet.PERP_MON, p.requestId, 0, 0, 0);
+        vm.prank(keeper);
+        uint256 id = trader.hedge(p);
+
+        assertEq(trader.restingHedge(Mainnet.PERP_MON), id, "recorded");
+        OrderV2 memory o = perpl.getOrderV2(Mainnet.PERP_MON, id);
+        assertEq(o.accountId, accountId, "ours");
+        assertEq(o.lotLNS, LOTS, "size");
+        assertEq(o.priceONS, price, "price");
+    }
+
+    function test_hedgeRefusesMoreThanHeldMinusShort() public {
+        uint256 price = _insideAsk();
+        _hedge(LOTS, price);
+        _takeAsk(price);
+        _cancelHedge();
+
+        // Short 3,700 against 3,700 MON held: one more lot is unhedged.
+        BasisTrader.HedgeParams memory p = _hedgeParams(1, _insideAsk());
+        vm.expectPartialRevert(BasisTrader.Unhedgeable.selector);
+        vm.prank(keeper);
+        trader.hedge(p);
+    }
+
+    function test_hedgeRefusesSecondWhileOneRests() public {
+        uint256 id = _hedge(LOTS / 2, _insideAsk());
+
+        BasisTrader.HedgeParams memory p = _hedgeParams(LOTS / 2, _insideAsk());
+        vm.expectRevert(abi.encodeWithSelector(BasisTrader.HedgeResting.selector, Mainnet.PERP_MON, id));
+        vm.prank(keeper);
+        trader.hedge(p);
+    }
+
+    function test_cancelHedgeRemovesOrder() public {
+        uint256 lockedBefore = trader.perplAccount().lockedBalanceCNS;
+        uint256 id = _hedge(LOTS, _insideAsk());
+
+        uint256 unfilled = _cancelHedge();
+
+        assertEq(unfilled, LOTS, "nothing had filled");
+        assertEq(trader.restingHedge(Mainnet.PERP_MON), 0, "record cleared");
+        assertTrue(perpl.getOrderV2(Mainnet.PERP_MON, id).accountId != accountId, "order gone");
+        assertEq(perpl.getPerpOrderLocks(accountId, Mainnet.PERP_MON).length, 0, "no lock left");
+        assertEq(trader.perplAccount().lockedBalanceCNS, lockedBefore, "locked balance released");
+    }
+
+    function test_exitBlockedWhileHedgeRests() public {
+        uint256 id = _hedge(LOTS, _insideAsk());
+        BasisTrader.ExitParams memory x = _exitParams();
+
+        vm.expectRevert(abi.encodeWithSelector(BasisTrader.HedgeResting.selector, Mainnet.PERP_MON, id));
+        vm.prank(keeper);
+        trader.exit(x);
+
+        vm.expectRevert(abi.encodeWithSelector(BasisTrader.HedgeResting.selector, Mainnet.PERP_MON, id));
+        trader.forceExit(x);
+    }
+
+    function test_filledHedgeClearsWithoutCallThenExits() public {
+        uint256 price = _insideAsk();
+        _hedge(LOTS, price);
+        _takeAsk(price);
+
+        vm.recordLogs();
+        uint256 unfilled = _cancelHedge();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            assertTrue(
+                logs[i].emitter != Mainnet.PERPL_EXCHANGE || logs[i].topics[0] != ORDER_REQUEST_V2,
+                "no order sent to Perpl"
+            );
+        }
+        assertEq(unfilled, 0, "fully filled");
+        assertEq(trader.restingHedge(Mainnet.PERP_MON), 0, "record cleared");
+
+        trader.setMarket(Mainnet.PERP_MON, _monMarket(-1_000_000));
+        BasisTrader.ExitParams memory x = _exitParams();
+        vm.prank(keeper);
+        BasisTrader.Fill memory fill = trader.exit(x);
+
+        (PositionInfoV2 memory pos,,) = trader.position(Mainnet.PERP_MON);
+        assertEq(pos.lotLNS, 0, "short closed");
+        assertEq(fill.assetAmount, LOTS * 1e18, "sold the hedged MON");
+        assertEq(address(trader).balance, 0, "no MON left");
+    }
+
+    /// A part fill leaves more MON than short, so the exit must be sized to
+    /// the filled lots; sized to the whole balance, Perpl refuses to close
+    /// more than the short.
+    function test_partFillExitsOnlyTheFilledLots() public {
+        uint256 filled = 1_000;
+        uint256 price = _insideAsk();
+        _hedge(LOTS, price);
+        _takeAsk(price, filled);
+
+        assertEq(_cancelHedge(), LOTS - filled, "unfilled rest cancelled");
+        (PositionInfoV2 memory pos,,) = trader.position(Mainnet.PERP_MON);
+        assertEq(pos.lotLNS, filled, "short is the filled part");
+
+        trader.setMarket(Mainnet.PERP_MON, _monMarket(-1_000_000));
+        BasisTrader.ExitParams memory whole = _exitParams();
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                bytes4(keccak256("CloseOrderExceedsPosition(uint256,uint256)")), filled, LOTS
+            )
+        );
+        vm.prank(keeper);
+        trader.exit(whole);
+
+        BasisTrader.ExitParams memory part = _exitParams();
+        part.assetIn = filled * 1e18;
+        vm.prank(keeper);
+        trader.exit(part);
+
+        (pos,,) = trader.position(Mainnet.PERP_MON);
+        assertEq(pos.lotLNS, 0, "short closed");
+        assertEq(address(trader).balance, (LOTS - filled) * 1e18, "unhedged rest kept");
+    }
+
+    function test_onlyKeeperCanHedgeOrCancel() public {
+        BasisTrader.HedgeParams memory p = _hedgeParams(LOTS, _insideAsk());
+
+        vm.expectRevert(BasisTrader.NotKeeper.selector);
+        vm.prank(outsider);
+        trader.hedge(p);
+
+        vm.expectRevert(BasisTrader.NotKeeper.selector);
+        vm.prank(outsider);
+        trader.cancelHedge(Mainnet.PERP_MON, block.number);
+    }
+
+    function test_crossingHedgeLeavesNoState() public {
+        PerpetualInfoV2 memory info = perpl.getPerpetualInfoV2(Mainnet.PERP_MON);
+        BasisTrader.HedgeParams memory p = _hedgeParams(LOTS, info.maxBidPriceONS);
+
+        // Perpl's own error, not ours.
+        vm.expectPartialRevert(bytes4(keccak256("CrossesBook(uint256,uint256,uint256,bool,uint256,bool)")));
+        vm.prank(keeper);
+        trader.hedge(p);
+
+        assertEq(trader.restingHedge(Mainnet.PERP_MON), 0, "nothing recorded");
+        (PositionInfoV2 memory pos,,) = trader.position(Mainnet.PERP_MON);
+        assertEq(pos.lotLNS, 0, "no position");
+    }
+
+    /// A cancel that returns but leaves the order resting must not unblock
+    /// `exit`. Perpl is mocked to do nothing for this one descriptor, because
+    /// a stale request ID does not: Perpl accepts it on a direct call.
+    function test_ineffectiveCancelReverts() public {
+        uint256 id = _hedge(LOTS, _insideAsk());
+        uint256 requestId = _nextDescId();
+        OrderDesc memory cancel = OrderDesc({
+            orderDescId: requestId,
+            perpId: Mainnet.PERP_MON,
+            orderType: CANCEL,
+            orderId: id,
+            pricePNS: 0,
+            lotLNS: 0,
+            expiryBlock: 0,
+            postOnly: false,
+            fillOrKill: false,
+            immediateOrCancel: false,
+            maxMatches: 0,
+            leverageHdths: 0,
+            lastExecutionBlock: 0,
+            amountCNS: 0,
+            maxNegPnlCollatBPS: 0
+        });
+        vm.mockCall(
+            Mainnet.PERPL_EXCHANGE,
+            abi.encodeCall(IPerplExchange.execOrder, (cancel)),
+            abi.encode(OrderSignature({perpId: 0, orderId: 0}))
+        );
+
+        vm.expectRevert(abi.encodeWithSelector(BasisTrader.HedgeNotCancelled.selector, id));
+        vm.prank(keeper);
+        trader.cancelHedge(Mainnet.PERP_MON, requestId);
+        vm.clearMockedCalls();
+
+        assertEq(trader.restingHedge(Mainnet.PERP_MON), id, "record kept");
+        assertEq(perpl.getOrderV2(Mainnet.PERP_MON, id).accountId, accountId, "order still rests");
+        BasisTrader.ExitParams memory x = _exitParams();
+        vm.expectRevert(abi.encodeWithSelector(BasisTrader.HedgeResting.selector, Mainnet.PERP_MON, id));
+        vm.prank(keeper);
+        trader.exit(x);
+    }
+
+    function _hedgeParams(uint256 lots, uint256 pricePNS) internal returns (BasisTrader.HedgeParams memory) {
+        return BasisTrader.HedgeParams({
+            perpId: Mainnet.PERP_MON, lotLNS: lots, pricePNS: pricePNS, marginCNS: 0, requestId: _nextDescId()
+        });
+    }
+
+    function _hedge(uint256 lots, uint256 pricePNS) internal returns (uint256) {
+        BasisTrader.HedgeParams memory p = _hedgeParams(lots, pricePNS);
+        vm.prank(keeper);
+        return trader.hedge(p);
+    }
+
+    function _cancelHedge() internal returns (uint256) {
+        uint256 requestId = _nextDescId();
+        vm.prank(keeper);
+        return trader.cancelHedge(Mainnet.PERP_MON, requestId);
+    }
+}
+
+contract DeployHedgeTest is HedgeFixture {
+    function test_deployHedgeOpensAccountAndMonMarket() public {
+        _forkMonadAt(PROBE_BLOCK);
+        _fundAusd(DEFAULT_SENDER, AUSD_SEED);
+
+        BasisTrader deployed = new DeployHedge().run(makeAddr("keeper"), AUSD_SEED);
+
+        assertGt(deployed.perplAccountId(), 0, "Perpl account opened");
+        (bool enabled,,,,,,,,,,,,) = deployed.markets(Mainnet.PERP_MON);
+        assertTrue(enabled, "MON market registered");
+        assertEq(deployed.owner(), DEFAULT_SENDER, "broadcaster owns it");
+    }
+}

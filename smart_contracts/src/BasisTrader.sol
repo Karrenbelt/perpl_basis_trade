@@ -11,9 +11,11 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {
     IPerplExchange,
     OrderDesc,
+    OrderSignature,
     PerpetualInfoV2,
     PositionInfoV2,
-    AccountInfo
+    AccountInfo,
+    OrderV2
 } from "./interfaces/IPerplExchange.sol";
 import {IKuruRouter} from "./interfaces/IKuru.sol";
 import {BasisMath} from "./libraries/BasisMath.sol";
@@ -43,6 +45,7 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
     /// @notice Perpl `OrderDescEnum`.
     uint8 internal constant ORDER_OPEN_SHORT = 1;
     uint8 internal constant ORDER_CLOSE_SHORT = 3;
+    uint8 internal constant ORDER_CANCEL = 4;
 
     /// @notice Perpl `PositionEnum`: `Long = 0`, `Short = 1`.
     uint8 internal constant POSITION_SHORT = 1;
@@ -121,6 +124,19 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
         uint256 requestId;
     }
 
+    struct HedgeParams {
+        uint256 perpId;
+        /// Short to rest on the book, in lots.
+        uint256 lotLNS;
+        /// Price the short rests at, in PNS. Post-only: a price that would
+        /// cross the book reverts in Perpl.
+        uint256 pricePNS;
+        /// AUSD moved from this contract into the Perpl account first, in CNS.
+        /// Zero leaves the order to draw on the account's existing balance.
+        uint256 marginCNS;
+        uint256 requestId;
+    }
+
     struct Fill {
         uint256 perpId;
         /// Spot leg in AUSD terms, converted at `cashPegPpm`, and covering only
@@ -151,6 +167,10 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
     mapping(uint256 perpId => Market) public markets;
     mapping(address keeper => bool) public keepers;
 
+    /// @notice Perpl order ID of the post-only hedge resting on each market;
+    ///         zero when none rests. At most one per market.
+    mapping(uint256 perpId => uint256 orderId) public restingHedge;
+
     // --------------------------------------------------------------------
     // Events
     // --------------------------------------------------------------------
@@ -160,6 +180,16 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
     event KeeperSet(address indexed keeper, bool allowed);
     event Entered(uint256 indexed perpId, uint256 indexed requestId, Fill fill);
     event Exited(uint256 indexed perpId, uint256 indexed requestId, Fill fill, bool forced);
+    event HedgePosted(
+        uint256 indexed perpId, uint256 indexed requestId, uint256 orderId, uint256 lotLNS, uint256 pricePNS
+    );
+    /// @dev `unfilledLotLNS` is zero whenever no order of ours remained at the
+    ///      ID: a full fill, but also an order Perpl removed itself (an admin
+    ///      or liquidator cancel). It does not prove a fill; filled lots are
+    ///      read from the position.
+    event HedgeCancelled(
+        uint256 indexed perpId, uint256 indexed requestId, uint256 orderId, uint256 unfilledLotLNS
+    );
     event MarginDeposited(uint256 amountCNS);
     event MarginWithdrawn(uint256 amountCNS);
     event PositionToppedUp(uint256 indexed perpId, uint256 amountCNS);
@@ -190,6 +220,11 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
     error PegOutOfBand(uint32 peg, uint32 min, uint32 max);
     error BadPegBand();
     error ZeroAddress();
+    error HedgeResting(uint256 perpId, uint256 orderId);
+    error NoRestingHedge(uint256 perpId);
+    error Unhedgeable(uint256 shortAmount, uint256 heldAmount);
+    error HedgeNotPosted(uint256 orderId);
+    error HedgeNotCancelled(uint256 orderId);
 
     // --------------------------------------------------------------------
     // Setup
@@ -274,6 +309,9 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
         if (perplAccountId == 0) revert AccountNotOpen();
         emit MarginDeposited(amountCNS);
         AUSD.forceApprove(address(PERPL), amountCNS);
+        // Reached from `hedge` before it records the order ID, which exists
+        // only after the order call; `hedge` is `nonReentrant`.
+        // forge-lint: disable-next-line(reentrancy-no-eth)
         PERPL.depositCollateral(amountCNS);
         AUSD.forceApprove(address(PERPL), 0);
     }
@@ -363,6 +401,114 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
     }
 
     // --------------------------------------------------------------------
+    // Hedge
+    // --------------------------------------------------------------------
+
+    /// @notice Rest a post-only short against spot this contract already
+    ///         holds, so the hedge is paid the maker side of the spread.
+    /// @dev The short, filled and resting, never exceeds the spot held: a
+    ///      late fill is still hedged. Perpl defines some failures as events
+    ///      (`OrderPostFailed`), so the order is read back before it is recorded.
+    function hedge(HedgeParams calldata p) external nonReentrant onlyKeeper returns (uint256 orderId) {
+        Market memory m = markets[p.perpId];
+        if (!m.enabled) revert MarketDisabled(p.perpId);
+        uint256 accountId = perplAccountId;
+        if (accountId == 0) revert AccountNotOpen();
+        uint256 resting = restingHedge[p.perpId];
+        if (resting != 0) revert HedgeResting(p.perpId, resting);
+
+        // Perpl has no position getter without the mark; it is not needed here.
+        // forge-lint: disable-next-line(unused-return)
+        (PositionInfoV2 memory pos,,) = PERPL.getPositionV2(p.perpId, accountId);
+        if (pos.lotLNS != 0 && pos.positionType != POSITION_SHORT) revert NotShort(pos.positionType);
+        uint256 shortAmount = BasisMath.lotsToToken(pos.lotLNS + p.lotLNS, m.spotDecimals, m.lotDecimals);
+        uint256 held = _spotBalance(m.spotToken);
+        if (shortAmount > held) revert Unhedgeable(shortAmount, held);
+
+        if (p.marginCNS != 0) depositMargin(p.marginCNS);
+
+        // The order ID exists only once Perpl has accepted the order, so the
+        // record is written after the call; `nonReentrant` covers the gap.
+        // forge-lint: disable-start(reentrancy-no-eth)
+        OrderSignature memory sig = PERPL.execOrder(
+            OrderDesc({
+                orderDescId: p.requestId,
+                perpId: p.perpId,
+                orderType: ORDER_OPEN_SHORT,
+                orderId: 0,
+                pricePNS: p.pricePNS,
+                lotLNS: p.lotLNS,
+                expiryBlock: 0,
+                postOnly: true,
+                fillOrKill: false,
+                immediateOrCancel: false,
+                maxMatches: 0,
+                leverageHdths: m.leverageHdths,
+                lastExecutionBlock: 0,
+                amountCNS: 0,
+                maxNegPnlCollatBPS: m.maxNegPnlCollatBps
+            })
+        );
+        // forge-lint: disable-end(reentrancy-no-eth)
+        orderId = sig.orderId;
+
+        OrderV2 memory o = PERPL.getOrderV2(p.perpId, orderId);
+        if (o.accountId != accountId || o.lotLNS != p.lotLNS) revert HedgeNotPosted(orderId);
+
+        restingHedge[p.perpId] = orderId;
+        // forge-lint: disable-next-line(reentrancy-events)
+        emit HedgePosted(p.perpId, p.requestId, orderId, p.lotLNS, p.pricePNS);
+    }
+
+    /// @notice Take the resting hedge off the book, or forget it if it has
+    ///         filled, which unblocks `exit`.
+    /// @dev Reverts unless the order is gone afterwards: clearing the record
+    ///      while the ask still rests would let `exit` sell the spot under a
+    ///      short that can still grow.
+    function cancelHedge(uint256 perpId, uint256 requestId)
+        external
+        nonReentrant
+        onlyKeeper
+        returns (uint256 unfilledLotLNS)
+    {
+        uint256 orderId = restingHedge[perpId];
+        if (orderId == 0) revert NoRestingHedge(perpId);
+        delete restingHedge[perpId];
+
+        uint256 accountId = perplAccountId;
+        OrderV2 memory o = PERPL.getOrderV2(perpId, orderId);
+        bool live = o.accountId == accountId;
+        if (live) unfilledLotLNS = o.lotLNS;
+        emit HedgeCancelled(perpId, requestId, orderId, unfilledLotLNS);
+        if (!live) return unfilledLotLNS;
+
+        // The returned signature carries nothing a cancel needs; the read-back
+        // below is what decides.
+        // forge-lint: disable-start(unused-return)
+        PERPL.execOrder(
+            OrderDesc({
+                orderDescId: requestId,
+                perpId: perpId,
+                orderType: ORDER_CANCEL,
+                orderId: orderId,
+                pricePNS: 0,
+                lotLNS: 0,
+                expiryBlock: 0,
+                postOnly: false,
+                fillOrKill: false,
+                immediateOrCancel: false,
+                maxMatches: 0,
+                leverageHdths: 0,
+                lastExecutionBlock: 0,
+                amountCNS: 0,
+                maxNegPnlCollatBPS: 0
+            })
+        );
+        // forge-lint: disable-end(unused-return)
+        if (PERPL.getOrderV2(perpId, orderId).accountId == accountId) revert HedgeNotCancelled(orderId);
+    }
+
+    // --------------------------------------------------------------------
     // Exit
     // --------------------------------------------------------------------
 
@@ -385,6 +531,10 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
         Market memory m = markets[p.perpId];
         if (!m.enabled) revert MarketDisabled(p.perpId);
         if (perplAccountId == 0) revert AccountNotOpen();
+        // A resting ask could fill after the spot is sold, and could match
+        // the buy-back below against ourselves.
+        uint256 resting = restingHedge[p.perpId];
+        if (resting != 0) revert HedgeResting(p.perpId, resting);
 
         _checkPeg(m, p.cashPegPpm);
 
