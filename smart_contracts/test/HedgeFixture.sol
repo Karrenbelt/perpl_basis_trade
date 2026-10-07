@@ -19,6 +19,10 @@ abstract contract HedgeFixture is ForkFixture {
     uint256 internal constant LOTS = 3_700;
     uint256 internal constant AUSD_SEED = 110e6;
 
+    /// The price bound `DeployHedge` sets on the MON market.
+    uint16 internal constant MAX_DISCOUNT_BPS = 50;
+    uint32 internal constant MAX_ORACLE_AGE_SEC = 60;
+
     uint8 internal constant OPEN_LONG = 0;
     uint8 internal constant OPEN_SHORT = 1;
     uint8 internal constant CANCEL = 4;
@@ -36,6 +40,7 @@ abstract contract HedgeFixture is ForkFixture {
         trader.fund(Mainnet.AUSD, AUSD_SEED);
         accountId = trader.openPerplAccount(AUSD_SEED);
         trader.setMarket(Mainnet.PERP_MON, _monMarket(0));
+        trader.setHedgeBound(Mainnet.PERP_MON, MAX_DISCOUNT_BPS, MAX_ORACLE_AGE_SEC);
     }
 
     function _monMarket(int64 minExitEdgePpm) internal pure returns (BasisTrader.Market memory) {

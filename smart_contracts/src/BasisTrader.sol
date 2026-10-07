@@ -50,6 +50,8 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
     /// @notice Perpl `PositionEnum`: `Long = 0`, `Short = 1`.
     uint8 internal constant POSITION_SHORT = 1;
 
+    uint256 internal constant BPS = 10_000;
+
     struct Market {
         bool enabled;
         /// Spot token bought against `cashToken`. `address(0)` means native MON.
@@ -171,6 +173,13 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
     ///         zero when none rests. At most one per market.
     mapping(uint256 perpId => uint256 orderId) public restingHedge;
 
+    /// @notice Largest discount to Perpl's oracle, in bps, at which `hedge`
+    ///         may rest a short.
+    mapping(uint256 perpId => uint16) public hedgeMaxDiscountBps;
+    /// @notice Oldest Perpl oracle, in seconds, that `hedge` prices against.
+    ///         Zero means no bound is set, and `hedge` refuses.
+    mapping(uint256 perpId => uint32) public hedgeMaxOracleAgeSec;
+
     // --------------------------------------------------------------------
     // Events
     // --------------------------------------------------------------------
@@ -190,6 +199,7 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
     event HedgeCancelled(
         uint256 indexed perpId, uint256 indexed requestId, uint256 orderId, uint256 unfilledLotLNS
     );
+    event HedgeBoundSet(uint256 indexed perpId, uint16 maxDiscountBps, uint32 maxOracleAgeSec);
     event MarginDeposited(uint256 amountCNS);
     event MarginWithdrawn(uint256 amountCNS);
     event PositionToppedUp(uint256 indexed perpId, uint256 amountCNS);
@@ -225,6 +235,11 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
     error Unhedgeable(uint256 shortAmount, uint256 heldAmount);
     error HedgeNotPosted(uint256 orderId);
     error HedgeNotCancelled(uint256 orderId);
+    error BadHedgeBound();
+    error HedgeBoundNotSet(uint256 perpId);
+    error OracleUnusable(uint256 perpId);
+    error OracleStale(uint256 oracleTimestampSec, uint256 maxAgeSec);
+    error HedgeBelowOracle(uint256 pricePNS, uint256 oraclePNS, uint256 maxDiscountBps);
 
     // --------------------------------------------------------------------
     // Setup
@@ -278,6 +293,16 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
     function setKeeper(address keeper, bool allowed) external onlyOwner {
         keepers[keeper] = allowed;
         emit KeeperSet(keeper, allowed);
+    }
+
+    /// @notice Bound the price `hedge` may rest a short at, against Perpl's oracle.
+    /// @dev Without it the keeper alone chooses the price, and could rest the
+    ///      short under a bid it has depressed and fill it from its own account.
+    function setHedgeBound(uint256 perpId, uint16 maxDiscountBps, uint32 maxOracleAgeSec) external onlyOwner {
+        if (maxDiscountBps >= BPS || maxOracleAgeSec == 0) revert BadHedgeBound();
+        hedgeMaxDiscountBps[perpId] = maxDiscountBps;
+        hedgeMaxOracleAgeSec[perpId] = maxOracleAgeSec;
+        emit HedgeBoundSet(perpId, maxDiscountBps, maxOracleAgeSec);
     }
 
     // --------------------------------------------------------------------
@@ -416,6 +441,7 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
         if (accountId == 0) revert AccountNotOpen();
         uint256 resting = restingHedge[p.perpId];
         if (resting != 0) revert HedgeResting(p.perpId, resting);
+        _checkHedgePrice(p.perpId, p.pricePNS);
 
         // Perpl has no position getter without the mark; it is not needed here.
         // forge-lint: disable-next-line(unused-return)
@@ -678,6 +704,28 @@ contract BasisTrader is Ownable2Step, ReentrancyGuardTransient {
     function _checkPeg(Market memory m, uint32 peg) internal pure {
         if (peg < m.minCashPegPpm || peg > m.maxCashPegPpm) {
             revert PegOutOfBand(peg, m.minCashPegPpm, m.maxCashPegPpm);
+        }
+    }
+
+    /// @dev Fails closed: no bound, an oracle Perpl does not use, and a stale
+    ///      oracle all refuse. The age is stored rather than read from Perpl's
+    ///      `refPriceMaxAgeSec` so that it holds if Perpl raises its own limit.
+    ///      `price × BPS ≥ oracle × (BPS − discount)` has no division, so no
+    ///      rounding; both prices are in the perpetual's PNS.
+    function _checkHedgePrice(uint256 perpId, uint256 pricePNS) internal view {
+        uint256 maxAgeSec = hedgeMaxOracleAgeSec[perpId];
+        if (maxAgeSec == 0) revert HedgeBoundNotSet(perpId);
+        PerpetualInfoV2 memory info = PERPL.getPerpetualInfoV2(perpId);
+        if (info.oraclePNS == 0 || info.ignOracle) revert OracleUnusable(perpId);
+        // The oracle's age is only defined against block time; a skew of a few
+        // seconds is small against an age limit of tens of seconds.
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > info.oracleTimestampSec + maxAgeSec) {
+            revert OracleStale(info.oracleTimestampSec, maxAgeSec);
+        }
+        uint256 maxDiscountBps = hedgeMaxDiscountBps[perpId];
+        if (pricePNS * BPS < info.oraclePNS * (BPS - maxDiscountBps)) {
+            revert HedgeBelowOracle(pricePNS, info.oraclePNS, maxDiscountBps);
         }
     }
 
