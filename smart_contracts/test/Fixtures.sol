@@ -23,8 +23,12 @@ abstract contract ForkFixture is Test {
     address[] internal ausdWhales;
 
     function _forkMonad() internal {
+        _forkMonadAt(vm.envOr("MONAD_FORK_BLOCK", uint256(0)));
+    }
+
+    /// @param forkBlock Zero forks the latest block.
+    function _forkMonadAt(uint256 forkBlock) internal {
         string memory rpc = vm.envString("MONAD_RPC_URL");
-        uint256 forkBlock = vm.envOr("MONAD_FORK_BLOCK", uint256(0));
         if (forkBlock == 0) {
             vm.createSelectFork(rpc);
         } else {
