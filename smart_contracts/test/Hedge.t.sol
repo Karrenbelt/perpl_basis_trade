@@ -2,6 +2,9 @@
 pragma solidity ^0.8.28;
 
 import {Vm} from "forge-std/Vm.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {HedgeFixture} from "./HedgeFixture.sol";
 import {Mainnet} from "./Addresses.sol";
@@ -222,6 +225,133 @@ contract HedgeTest is HedgeFixture {
         trader.exit(x);
     }
 
+    function test_unusableOracleReverts() public {
+        uint256 price = _insideAsk();
+
+        PerpetualInfoV2 memory info = perpl.getPerpetualInfoV2(Mainnet.PERP_MON);
+        info.oraclePNS = 0;
+        _expectOracleUnusable(info, price);
+
+        info = perpl.getPerpetualInfoV2(Mainnet.PERP_MON);
+        info.ignOracle = true;
+        _expectOracleUnusable(info, price);
+    }
+
+    function test_hedgeUnderBoundReverts() public {
+        PerpetualInfoV2 memory info = perpl.getPerpetualInfoV2(Mainnet.PERP_MON);
+        uint256 floor = Math.ceilDiv(info.oraclePNS * (10_000 - MAX_DISCOUNT_BPS), 10_000);
+        assertLe(floor, info.maxBidPriceONS, "precondition: a post at the floor crosses the book");
+
+        BasisTrader.HedgeParams memory p = _hedgeParams(LOTS, floor - 1);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BasisTrader.HedgeBelowOracle.selector, floor - 1, info.oraclePNS, uint256(MAX_DISCOUNT_BPS)
+            )
+        );
+        vm.prank(keeper);
+        trader.hedge(p);
+
+        // Perpl's own error shows that our check let the floor through.
+        p = _hedgeParams(LOTS, floor);
+        vm.expectPartialRevert(bytes4(keccak256("CrossesBook(uint256,uint256,uint256,bool,uint256,bool)")));
+        vm.prank(keeper);
+        trader.hedge(p);
+    }
+
+    function test_staleOracleReverts() public {
+        uint256 price = _insideAsk();
+        uint256 oracleTs = perpl.getPerpetualInfoV2(Mainnet.PERP_MON).oracleTimestampSec;
+
+        vm.warp(oracleTs + MAX_ORACLE_AGE_SEC + 1);
+        BasisTrader.HedgeParams memory p = _hedgeParams(LOTS, price);
+        vm.expectRevert(
+            abi.encodeWithSelector(BasisTrader.OracleStale.selector, oracleTs, uint256(MAX_ORACLE_AGE_SEC))
+        );
+        vm.prank(keeper);
+        trader.hedge(p);
+
+        vm.warp(oracleTs + MAX_ORACLE_AGE_SEC);
+        p = _hedgeParams(LOTS, price);
+        vm.prank(keeper);
+        uint256 id = trader.hedge(p);
+        assertEq(perpl.getOrderV2(Mainnet.PERP_MON, id).accountId, accountId, "rests at the age limit");
+    }
+
+    function test_hedgeRevertsWithoutBound() public {
+        BasisTrader unbound =
+            new BasisTrader(Mainnet.AUSD, Mainnet.PERPL_EXCHANGE, Mainnet.KURU_ROUTER, address(this));
+        _fundAusd(address(this), AUSD_SEED);
+        IERC20(Mainnet.AUSD).approve(address(unbound), AUSD_SEED);
+        unbound.fund(Mainnet.AUSD, AUSD_SEED);
+        unbound.openPerplAccount(AUSD_SEED);
+        unbound.setMarket(Mainnet.PERP_MON, _monMarket(0));
+        vm.deal(address(unbound), LOTS * 1e18);
+
+        BasisTrader.HedgeParams memory p = _hedgeParams(LOTS, _insideAsk());
+        vm.expectRevert(abi.encodeWithSelector(BasisTrader.HedgeBoundNotSet.selector, Mainnet.PERP_MON));
+        unbound.hedge(p);
+    }
+
+    function test_onlyOwnerSetsHedgeBound() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, keeper));
+        vm.prank(keeper);
+        trader.setHedgeBound(Mainnet.PERP_MON, 0, 1);
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, outsider));
+        vm.prank(outsider);
+        trader.setHedgeBound(Mainnet.PERP_MON, 0, 1);
+
+        vm.expectEmit(true, false, false, true, address(trader));
+        emit BasisTrader.HedgeBoundSet(Mainnet.PERP_MON, 75, 30);
+        trader.setHedgeBound(Mainnet.PERP_MON, 75, 30);
+        assertEq(trader.hedgeMaxDiscountBps(Mainnet.PERP_MON), 75, "bps");
+        assertEq(trader.hedgeMaxOracleAgeSec(Mainnet.PERP_MON), 30, "age");
+    }
+
+    function test_setHedgeBoundRejectsBadValues() public {
+        vm.expectRevert(BasisTrader.BadHedgeBound.selector);
+        trader.setHedgeBound(Mainnet.PERP_MON, 10_000, MAX_ORACLE_AGE_SEC);
+
+        vm.expectRevert(BasisTrader.BadHedgeBound.selector);
+        trader.setHedgeBound(Mainnet.PERP_MON, MAX_DISCOUNT_BPS, 0);
+    }
+
+    /// Perpl's `increasePositionCollateral` takes no token, so where the
+    /// collateral comes from is read from the balances.
+    function test_topUpDrawsFromPerplBalance() public {
+        uint256 price = _insideAsk();
+        _hedge(LOTS, price);
+        _takeAsk(price);
+        _cancelHedge();
+        assertEq(IERC20(Mainnet.AUSD).balanceOf(address(trader)), 0, "contract holds no AUSD");
+
+        uint256 balanceBefore = trader.perplAccount().balanceCNS;
+        (PositionInfoV2 memory before,,) = trader.position(Mainnet.PERP_MON);
+
+        vm.prank(keeper);
+        trader.topUpPosition(Mainnet.PERP_MON, 5e6);
+
+        (PositionInfoV2 memory post,,) = trader.position(Mainnet.PERP_MON);
+        assertEq(post.depositCNS, before.depositCNS + 5e6, "position collateral up");
+        assertEq(trader.perplAccount().balanceCNS, balanceBefore - 5e6, "drawn from the account");
+        assertEq(IERC20(Mainnet.AUSD).balanceOf(address(trader)), 0, "contract still holds no AUSD");
+    }
+
+    /// Mocks perp 10's info only, and clears it, so that no later read in
+    /// the test sees the mocked oracle.
+    function _expectOracleUnusable(PerpetualInfoV2 memory info, uint256 pricePNS) internal {
+        BasisTrader.HedgeParams memory p = _hedgeParams(LOTS, pricePNS);
+        vm.mockCall(
+            Mainnet.PERPL_EXCHANGE,
+            abi.encodeCall(IPerplExchange.getPerpetualInfoV2, (Mainnet.PERP_MON)),
+            abi.encode(info)
+        );
+        vm.expectRevert(abi.encodeWithSelector(BasisTrader.OracleUnusable.selector, Mainnet.PERP_MON));
+        vm.prank(keeper);
+        trader.hedge(p);
+        vm.clearMockedCalls();
+    }
+
     function _hedgeParams(uint256 lots, uint256 pricePNS) internal returns (BasisTrader.HedgeParams memory) {
         return BasisTrader.HedgeParams({
             perpId: Mainnet.PERP_MON, lotLNS: lots, pricePNS: pricePNS, marginCNS: 0, requestId: _nextDescId()
@@ -242,15 +372,66 @@ contract HedgeTest is HedgeFixture {
 }
 
 contract DeployHedgeTest is HedgeFixture {
-    function test_deployHedgeOpensAccountAndMonMarket() public {
-        _forkMonadAt(PROBE_BLOCK);
-        _fundAusd(DEFAULT_SENDER, AUSD_SEED);
+    uint256 internal constant CLIP = 1_850;
 
-        BasisTrader deployed = new DeployHedge().run(makeAddr("keeper"), AUSD_SEED);
+    address internal keeper = makeAddr("keeper");
+
+    function test_deployHedgeOpensAccountAndMonMarket() public {
+        BasisTrader deployed = _deploy();
 
         assertGt(deployed.perplAccountId(), 0, "Perpl account opened");
-        (bool enabled,,,,,,,,,,,,) = deployed.markets(Mainnet.PERP_MON);
+        (
+            bool enabled,,,,,,
+            uint16 leverageHdths,,,
+            int64 minEntryEdgePpm,
+            int64 minExitEdgePpm,
+            uint32 minCashPegPpm,
+            uint32 maxCashPegPpm
+        ) = deployed.markets(Mainnet.PERP_MON);
         assertTrue(enabled, "MON market registered");
+        assertEq(leverageHdths, 100, "1x");
+        assertEq(minEntryEdgePpm, type(int64).max, "enter closed");
+        assertEq(minExitEdgePpm, 0, "exit floor");
+        assertEq(minCashPegPpm, 1_000_000, "peg band closed, low");
+        assertEq(maxCashPegPpm, 1_000_000, "peg band closed, high");
+        assertEq(deployed.hedgeMaxDiscountBps(Mainnet.PERP_MON), 50, "hedge bound");
+        assertEq(deployed.hedgeMaxOracleAgeSec(Mainnet.PERP_MON), 60, "oracle age");
         assertEq(deployed.owner(), DEFAULT_SENDER, "broadcaster owns it");
+        assertTrue(deployed.keepers(keeper), "keeper set");
+    }
+
+    /// Clip 1 filled and held at 1x, then clip 2 resting beside it, on the
+    /// AUSD the deploy seeds.
+    function test_deployedInstanceHoldsTwoClips() public {
+        BasisTrader deployed = _deploy();
+        vm.deal(address(deployed), 2 * CLIP * 1e18);
+
+        uint256 price = _insideAsk();
+        BasisTrader.HedgeParams memory p = _clip(price);
+        vm.prank(keeper);
+        deployed.hedge(p);
+        _takeAsk(price, CLIP);
+        uint256 cancelId = _nextDescId();
+        vm.prank(keeper);
+        deployed.cancelHedge(Mainnet.PERP_MON, cancelId);
+        (PositionInfoV2 memory pos,,) = deployed.position(Mainnet.PERP_MON);
+        assertEq(pos.lotLNS, CLIP, "clip 1 held");
+
+        p = _clip(_insideAsk());
+        vm.prank(keeper);
+        uint256 id = deployed.hedge(p);
+        assertEq(perpl.getOrderV2(Mainnet.PERP_MON, id).accountId, deployed.perplAccountId(), "clip 2 rests");
+    }
+
+    function _deploy() internal returns (BasisTrader) {
+        _forkMonadAt(PROBE_BLOCK);
+        _fundAusd(DEFAULT_SENDER, AUSD_SEED);
+        return new DeployHedge().run(keeper, AUSD_SEED);
+    }
+
+    function _clip(uint256 pricePNS) internal returns (BasisTrader.HedgeParams memory) {
+        return BasisTrader.HedgeParams({
+            perpId: Mainnet.PERP_MON, lotLNS: CLIP, pricePNS: pricePNS, marginCNS: 0, requestId: _nextDescId()
+        });
     }
 }
