@@ -83,6 +83,34 @@ struct PositionInfoV2 {
     uint256 priceResiduePNSQ16;
 }
 
+/// @dev Order IDs come from a bounded index and are reused once an order
+///      leaves the book, so an ID identifies our order only together with
+///      our `accountId`.
+struct OrderV2 {
+    uint32 accountId;
+    uint8 orderType;
+    uint24 priceONS;
+    uint40 lotLNS;
+    uint16 recycleFeeRaw;
+    uint32 expiryBlock;
+    uint16 leverageHdths;
+    uint16 orderId;
+    uint16 prevOrderId;
+    uint16 nextOrderId;
+    uint16 maxNegPnlCollatBPS;
+    uint8 builderId;
+    uint16 builderFeePer100K;
+}
+
+struct OrderLock {
+    uint32 orderLockId;
+    uint32 nextOrderLockId;
+    uint32 prevOrderLockId;
+    uint8 orderType;
+    uint40 lotLNS;
+    uint80 amountCNS;
+}
+
 struct PositionBitMap {
     uint256 bank1;
     uint256 bank2;
@@ -128,5 +156,8 @@ interface IPerplExchange {
             address verifierProxy
         );
     function getAccountByAddr(address accountAddress) external view returns (AccountInfo memory);
+    function getAccountById(uint256 accountId) external view returns (AccountInfo memory);
+    function getOrderV2(uint256 perpId, uint256 orderId) external view returns (OrderV2 memory);
+    function getPerpOrderLocks(uint256 accountId, uint256 perpId) external view returns (OrderLock[] memory);
     function getMinAccountOpenCNS() external view returns (uint256);
 }
