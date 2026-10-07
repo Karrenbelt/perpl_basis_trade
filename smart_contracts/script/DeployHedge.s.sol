@@ -13,8 +13,8 @@ import {Mainnet} from "../test/Addresses.sol";
 /// The broadcasting account (`--account`) becomes the owner and pays the AUSD.
 /// Usage: forge script script/DeployHedge.s.sol --sig 'run(address,uint256)' <keeper> <ausdSeedCNS>
 contract DeployHedge is Script {
-    /// The age equals Perpl's own `refPriceMaxAgeSec` on perp 10.
     uint16 internal constant HEDGE_MAX_DISCOUNT_BPS = 50;
+    /// Equal to Perpl's own `refPriceMaxAgeSec` on perp 10.
     uint32 internal constant HEDGE_MAX_ORACLE_AGE_SEC = 60;
 
     /// @param ausdSeedCNS AUSD in 6 dp. All of it opens the Perpl account, so
