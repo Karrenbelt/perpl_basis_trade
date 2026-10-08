@@ -17,6 +17,7 @@ import {
     PerpetualInfoV2,
     PositionInfoV2
 } from "../src/interfaces/IPerplExchange.sol";
+import {IKuruOrderBook} from "../src/interfaces/IKuru.sol";
 import {DeployHedge} from "../script/DeployHedge.s.sol";
 
 contract HedgeTest is HedgeFixture {
@@ -373,6 +374,10 @@ contract HedgeTest is HedgeFixture {
 
 contract DeployHedgeTest is HedgeFixture {
     uint256 internal constant CLIP = 1_850;
+    /// At the pinned price this buys about 750 MON, so the part of a lot left
+    /// unhedged is under about 1,330 ppm and the drift check (2,000 ppm)
+    /// cannot refuse before the edge gate.
+    uint256 internal constant ENTER_CASH = 20e6;
 
     address internal keeper = makeAddr("keeper");
 
@@ -421,6 +426,120 @@ contract DeployHedgeTest is HedgeFixture {
         vm.prank(keeper);
         uint256 id = deployed.hedge(p);
         assertEq(perpl.getOrderV2(Mainnet.PERP_MON, id).accountId, deployed.perplAccountId(), "clip 2 rests");
+    }
+
+    /// Any realised edge is below the stored entry floor of `type(int64).max`.
+    function test_deployedInstanceRefusesEnter() public {
+        BasisTrader deployed = _deploy();
+        deal(Mainnet.USDC, address(deployed), ENTER_CASH);
+
+        address[] memory route = new address[](1);
+        route[0] = Mainnet.BOOK_MON_USDC;
+        bool[] memory isBuy = new bool[](1);
+        isBuy[0] = true;
+        bool[] memory nativeSend = new bool[](1);
+        PerpetualInfoV2 memory info = perpl.getPerpetualInfoV2(Mainnet.PERP_MON);
+        BasisTrader.EnterParams memory p = BasisTrader.EnterParams({
+            perpId: Mainnet.PERP_MON,
+            cashIn: ENTER_CASH,
+            cashPegPpm: 1_000_000,
+            route: route,
+            isBuy: isBuy,
+            nativeSend: nativeSend,
+            minAssetOut: 0,
+            perplLimitPricePNS: info.maxBidPriceONS * 9_900 / 10_000,
+            minLotLNS: 1,
+            maxLotLNS: 10_000,
+            marginCNS: 0,
+            maxMatches: 100,
+            requestId: _nextDescId()
+        });
+
+        vm.expectPartialRevert(BasisTrader.EdgeTooThin.selector);
+        vm.prank(keeper);
+        deployed.enter(p);
+    }
+
+    /// With both clips' MON held, an exit sized to the balance asks Perpl to
+    /// close twice the short; and the closed peg band admits only par.
+    function test_deployedExitTakesClipSizeAndParPeg() public {
+        BasisTrader deployed = _deployWithClip1Filled();
+        BasisTrader.ExitParams memory x = _exitParams();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                bytes4(keccak256("CloseOrderExceedsPosition(uint256,uint256)")), CLIP, 2 * CLIP
+            )
+        );
+        vm.prank(DEFAULT_SENDER);
+        deployed.forceExit(x);
+
+        x.assetIn = CLIP * 1e18;
+        x.cashPegPpm = 999_999;
+        vm.expectRevert(
+            abi.encodeWithSelector(BasisTrader.PegOutOfBand.selector, 999_999, 1_000_000, 1_000_000)
+        );
+        vm.prank(DEFAULT_SENDER);
+        deployed.forceExit(x);
+
+        x.cashPegPpm = 1_000_001;
+        vm.expectRevert(
+            abi.encodeWithSelector(BasisTrader.PegOutOfBand.selector, 1_000_001, 1_000_000, 1_000_000)
+        );
+        vm.prank(DEFAULT_SENDER);
+        deployed.forceExit(x);
+    }
+
+    /// The keeper's exit is gated at floor 0 on the edge the same exit
+    /// realises; the owner's exit, within the stop-rule bounds, closes the
+    /// clip and keeps clip 2's MON.
+    function test_deployedExitGateThenForceExit() public {
+        BasisTrader deployed = _deployWithClip1Filled();
+        BasisTrader.ExitParams memory x = _exitParams();
+        x.assetIn = CLIP * 1e18;
+        // Kuru quotes USDC (6 dp) per MON (18 dp) in a 1e18 scale.
+        (uint256 kuruBid,) = IKuruOrderBook(Mainnet.BOOK_MON_USDC).bestBidAsk();
+        x.minCashOut = CLIP * kuruBid * 995 / (1_000 * 1e12);
+        uint256 usdcBefore = IERC20(Mainnet.USDC).balanceOf(address(deployed));
+
+        uint256 snap = vm.snapshotState();
+        vm.prank(DEFAULT_SENDER);
+        int256 edgePpm = deployed.forceExit(x).edgePpm;
+        vm.revertToState(snap);
+
+        BasisTrader.Fill memory fill;
+        if (edgePpm < 0) {
+            vm.expectRevert(abi.encodeWithSelector(BasisTrader.EdgeTooThin.selector, edgePpm, int256(0)));
+            vm.prank(keeper);
+            deployed.exit(x);
+            vm.prank(DEFAULT_SENDER);
+            fill = deployed.forceExit(x);
+        } else {
+            vm.prank(keeper);
+            fill = deployed.exit(x);
+        }
+
+        (PositionInfoV2 memory pos,,) = deployed.position(Mainnet.PERP_MON);
+        assertEq(pos.lotLNS, 0, "short closed");
+        assertEq(fill.lotLNS, CLIP, "clip bought back");
+        assertEq(address(deployed).balance, CLIP * 1e18, "clip 2 MON kept");
+        uint256 usdcOut = IERC20(Mainnet.USDC).balanceOf(address(deployed)) - usdcBefore;
+        assertEq(usdcOut, fill.spotNotionalCNS, "proceeds at par peg");
+        assertGe(usdcOut, x.minCashOut, "within the stop-rule floor");
+    }
+
+    function _deployWithClip1Filled() internal returns (BasisTrader deployed) {
+        deployed = _deploy();
+        vm.deal(address(deployed), 2 * CLIP * 1e18);
+
+        uint256 price = _insideAsk();
+        BasisTrader.HedgeParams memory p = _clip(price);
+        vm.prank(keeper);
+        deployed.hedge(p);
+        _takeAsk(price, CLIP);
+        uint256 cancelId = _nextDescId();
+        vm.prank(keeper);
+        deployed.cancelHedge(Mainnet.PERP_MON, cancelId);
     }
 
     function _deploy() internal returns (BasisTrader) {
